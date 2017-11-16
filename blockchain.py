@@ -1,3 +1,5 @@
+from gevent import monkey; monkey.patch_all()  # noqa
+
 import collections
 import hashlib
 import itertools
@@ -21,28 +23,36 @@ AvailableAmount = collections.namedtuple('AvailableAmount', ['transactions_hash'
 blockchain = []
 unconfirmed_transactions = []
 wallet = None
+is_mining = False
 
 
 @bottle.post('/create-wallet')
-def create_wallet(password):
+def create_wallet():
     global wallet
     if wallet is not None:
         bottle.abort(400, 'Wallet is already created')
 
-    password_hash = hashlib.sha1('password'.encode()).hexdigest()
+    password = (bottle.request.json or {}).get('password')
+    if password is None:
+        bottle.abort(400, 'Invalid password')
+
+    password_hash = hashlib.sha1(password.encode()).hexdigest()
     private_key = ecdsa.SigningKey.generate()
     wallet = Wallet(password_hash, private_key)
 
+    return 'Wallet created'
+
 
 @bottle.post('/create-genesis-block')
-def create_genesis_block(password):
+def create_genesis_block():
     if blockchain:
         bottle.abort(400, 'Genesis block is already created')
 
     if wallet is None:
         bottle.abort(400, 'Wallet not found')
 
-    if check_wallet_password(wallet, password):
+    password = (bottle.request.json or {}).get('password')
+    if not is_password_valid(wallet, password):
         bottle.abort(400, 'Invalid password')
 
     receiver_address = get_wallet_address(wallet.private_key)
@@ -55,13 +65,15 @@ def create_genesis_block(password):
     genesis_block = create_block(None, [transaction])
     blockchain.append(genesis_block)
 
+    return 'Genesis block created'
+
 
 @bottle.post('/create-transaction')
 def create_transaction(password, receiver_address, amount):
     if wallet is None:
         bottle.abort(400, 'Wallet not found')
 
-    if check_wallet_password(wallet, password):
+    if is_password_valid(wallet, password):
         bottle.abort(400, 'Invalid password')
 
     current_blockchain = blockchain.copy()
@@ -138,7 +150,9 @@ def mine():
     if not blockchain:
         bottle.abort(400, 'Cannot mine on empty blockchain')
 
-    while True:
+    global is_mining
+    is_mining = True
+    while is_mining:
         if not unconfirmed_transactions:
             time.sleep(CHECK_TRANSACTIONS_DELAY)
             continue
@@ -150,6 +164,14 @@ def mine():
         new_block = create_block(previous_block.block_hash, transactions)
 
         blockchain.append(new_block)
+
+    return 'Mining stopped'
+
+
+@bottle.post('/stop-mining')
+def stop_mining():
+    global is_mining
+    is_mining = False
 
 
 def create_block(previous_block_hash, transactions):
@@ -186,5 +208,11 @@ def get_transaction_hash(transfer):
     return hashlib.sha1(json.dumps(transfer).encode()).hexdigest()
 
 
-def check_wallet_password(wallet, password):
-    return hashlib.sha1(password.encode()).hexdigest() != wallet.password_hash
+def is_password_valid(wallet, password):
+    return (
+        password is not None and
+        hashlib.sha1(password.encode()).hexdigest() == wallet.password_hash
+    )
+
+
+bottle.run(server='gevent')
