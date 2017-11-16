@@ -1,193 +1,190 @@
-import datetime
+import collections
 import hashlib
+import itertools
 import json
+import time
 
 import bottle
-import requests
+import ecdsa
 
-node = bottle.Bottle()
+EMIT_PORTION = 50
+CHECK_TRANSACTIONS_DELAY = 3
 
-# Load configuration from a json file
-with open('config.json') as fp:
-    node.config.load_dict(json.load(fp))
+Wallet = collections.namedtuple('Wallet', ['password_hash', 'private_key'])
+TransactionInput = collections.namedtuple('TransactionInput', ['transaction_hash', 'amount'])
+TransactionOutput = collections.namedtuple('TransactionOutput', ['wallet_address', 'amount'])
+TransactionTransfer = collections.namedtuple('TransactionTransfer', ['inputs', 'output'])
+Transaction = collections.namedtuple('Transaction', ['hash', 'transfer'])
+Block = collections.namedtuple('Block', ['previous_hash', 'block_hash', 'transactions'])
+AvailableAmount = collections.namedtuple('AvailableAmount', ['transactions_hash', 'amount'])
 
-
-class Block:
-    def __init__(self, index, timestamp, data, previous_hash):
-        self.index = index
-        self.timestamp = timestamp
-        self.data = data
-        self.previous_hash = previous_hash
-        self.hash = self.hash_block()
-
-    def hash_block(self):
-        sha = hashlib.sha256()
-        sha.update((str(self.index) +
-                   str(self.timestamp) +
-                   str(self.data) +
-                   str(self.previous_hash)).encode('utf-8'))
-        return sha.hexdigest()
+blockchain = []
+unconfirmed_transactions = []
+wallet = None
 
 
-def create_genesis_block():
-    # Manually construct a block with index zero and arbitrary previous hash
-    return Block(0, datetime.datetime.now(), 'Genesis Block', '0')
+@bottle.post('/create-wallet')
+def create_wallet(password):
+    global wallet
+    if wallet is not None:
+        bottle.abort(400, 'Wallet is already created')
+
+    password_hash = hashlib.sha1('password'.encode()).hexdigest()
+    private_key = ecdsa.SigningKey.generate()
+    wallet = Wallet(password_hash, private_key)
 
 
-def next_block(last_block):
-    this_index = last_block.index + 1
-    this_timestamp = datetime.datetime.now()
-    this_data = 'Hey! I\'m block ' + str(this_index)
-    this_hash = last_block.hash
-    return Block(this_index, this_timestamp, this_data, this_hash)
+@bottle.post('/create-genesis-block')
+def create_genesis_block(password):
+    if blockchain:
+        bottle.abort(400, 'Genesis block is already created')
+
+    if wallet is None:
+        bottle.abort(400, 'Wallet not found')
+
+    if check_wallet_password(wallet, password):
+        bottle.abort(400, 'Invalid password')
+
+    receiver_address = get_wallet_address(wallet.private_key)
+    output = TransactionOutput(receiver_address, EMIT_PORTION)
+
+    transfer = TransactionTransfer(None, output)
+    transaction_hash = get_transaction_hash(transfer)
+    transaction = Transaction(transaction_hash, transfer)
+
+    genesis_block = create_block(None, [transaction])
+    blockchain.append(genesis_block)
 
 
-# Create the blockchain and add the genesis block
-blockchain = [create_genesis_block()]
-previous_block = blockchain[0]
+@bottle.post('/create-transaction')
+def create_transaction(password, receiver_address, amount):
+    if wallet is None:
+        bottle.abort(400, 'Wallet not found')
 
-# How many blocks should we add to the chain after the genesis block
-num_of_blocks_to_add = 20
+    if check_wallet_password(wallet, password):
+        bottle.abort(400, 'Invalid password')
 
-# Add blocks to the chain
-for i in range(0, num_of_blocks_to_add):
-    block_to_add = next_block(previous_block)
-    blockchain.append(block_to_add)
-    previous_block = block_to_add
+    current_blockchain = blockchain.copy()
+    wallet_address = get_wallet_address(wallet.private_key)
+    wallet_balance = get_wallet_balance(current_blockchain, wallet_address)
+    if amount > wallet_balance:
+        bottle.abort(400, 'Not enough tokens')
 
-    # Tell everyone about it!
-    print('Block #{} has been added to the blockchain!'.format(block_to_add.index))
-    print('Hash: {}\n'.format(block_to_add.hash))
+    output = TransactionOutput(receiver_address, amount)
 
-# Store the transactions that this node has in a list
-this_nodes_transactions = []
+    incoming_transactions = (
+        transaction
+        for block in current_blockchain
+        for transaction in block.transactions
+        if transaction.transfer.output.wallet_address == wallet_address
+    )
+    transaction_spends = {
+        transaction_input.transaction_hash: sum(
+            transaction_input.amount for transaction_input in transaction_inputs
+        )
+        for transaction_input, transaction_inputs in itertools.groupby(
+            sorted(
+                (
+                    transaction_input
+                    for block in current_blockchain
+                    for transaction in block.transactions
+                    for transaction_input in transaction.transfer.inputs
+                    for block1 in current_blockchain
+                    for transaction1 in block1.transactions
+                    if transaction1.hash == transaction_input.transaction_hash and
+                    transaction1.transfer.output.wallet_address == wallet_address
+                ),
+                key=lambda t: t.transaction_hash
+            ),
+            key=lambda t: t.transaction_hash
+        )
+    }
+    available_amounts = sorted(
+        (
+            AvailableAmount(
+                transaction.hash,
+                transaction.transfer.output.amount - transaction_spends[transaction.hash]
+            )
+            for transaction in incoming_transactions
+            if transaction.transfer.output.amount - transaction_spends[transaction.hash] > 0
+        ),
+        key=lambda available_amount: available_amount.amount
+    )
+
+    inputs = []
+    checking_amount = amount
+    for available_amount in available_amounts:
+        if available_amount.amount >= checking_amount:
+            inputs.append(TransactionInput(available_amount.transaction_hash, checking_amount))
+            break
+
+        inputs.append(
+            TransactionInput(
+                available_amount.transaction_hash,
+                checking_amount - available_amount.amount
+            )
+        )
+        checking_amount -= available_amount.amount
+
+    transfer = TransactionTransfer(inputs, output)
+    transaction_hash = get_transaction_hash(transfer)
+    transaction = Transaction(transaction_hash, transfer)
+
+    unconfirmed_transactions.append(transaction)
 
 
-@node.post('/txion')
-def transaction():
-    # On each new POST request, we extract the transaction data
-    new_txion = bottle.request.json
-
-    # Then we add the transaction to our list
-    this_nodes_transactions.append(new_txion)
-
-    # Because the transaction was successfully submitted, we log it to our console
-    print('New transaction')
-    print('FROM: {}'.format(new_txion['from']))
-    print('TO: {}'.format(new_txion['to']))
-    print('AMOUNT: {}\n'.format(new_txion['amount']))
-
-    # Then we let the client know it worked out
-    return 'Transaction submission successful\n'
-
-
-def proof_of_work(last_proof):
-    # Create a variable that we will use to find our next proof of work
-    incrementor = last_proof + 1
-
-    # Keep incrementing the incrementor until it's equal to a number divisible by 9
-    # and the proof of work of the previous block in the chain
-    while not (incrementor % 9 == 0 and incrementor % last_proof == 0):
-        incrementor += 1
-
-    # Once that number is found, we can return it as a proof of our work
-    return incrementor
-
-
-@node.get('/mine')
+@bottle.post('/mine')
 def mine():
-    # Get the last proof of work
-    last_block = blockchain[len(blockchain) - 1]
-    last_proof = last_block.data['proof-of-work']
+    if not blockchain:
+        bottle.abort(400, 'Cannot mine on empty blockchain')
 
-    # Find the proof of work for the current block being mined
-    # Note: The program will hang here until a new proof of work is found
-    proof = proof_of_work(last_proof)
+    while True:
+        if not unconfirmed_transactions:
+            time.sleep(CHECK_TRANSACTIONS_DELAY)
+            continue
 
-    # Once we find a valid proof of work, we know we can mine a block so we reward the miner
-    # by adding a transaction
-    global this_nodes_transactions
-    this_nodes_transactions.append({
-        'from': 'network',
-        'to': bottle.request.app.config['wallet'],
-        'amount': 1
-    })
+        transactions = unconfirmed_transactions.copy()
+        unconfirmed_transactions.clear()
 
-    # Now we can gather the data needed to create the new block
-    new_block_data = {'proof-of-work': proof, 'transactions': list(this_nodes_transactions)}
-    new_block_index = last_block.index + 1
-    new_block_timestamp = datetime.datetime.now()
-    last_block_hash = last_block.hash
+        previous_block = blockchain[-1]
+        new_block = create_block(previous_block.block_hash, transactions)
 
-    # Empty transaction list
-    this_nodes_transactions = []
-
-    # Now create the new block!
-    mined_block = Block(new_block_index,
-                        new_block_timestamp,
-                        new_block_data,
-                        last_block_hash)
-    blockchain.append(mined_block)
-
-    # Let the client know we mined a block
-    return json.dumps({
-        'index': new_block_index,
-        'timestamp': str(new_block_timestamp),
-        'data': new_block_data,
-        'hash': last_block_hash
-    }) + '\n'
+        blockchain.append(new_block)
 
 
-@node.get('/blocks')
-def get_blocks():
-    chain_to_send = blockchain
-
-    # Convert our blocks into dictionaries so we can send them as json objects later
-    for block in chain_to_send:
-        block_index = str(block.index)
-        block_timestamp = str(block.timestamp)
-        block_data = str(block.data)
-        block_hash = block.hash
-        block = {
-            'index': block_index,
-            'timestamp': block_timestamp,
-            'data': block_data,
-            'hash': block_hash
-        }
-
-    # Send our chain to whomever requested it
-    chain_to_send = json.dumps(chain_to_send)
-    return chain_to_send
+def create_block(previous_block_hash, transactions):
+    block_hash = hashlib.sha1(json.dumps(transactions).encode()).hexdigest()
+    return Block(previous_block_hash, block_hash, transactions)
 
 
-peer_nodes = []
+def get_wallet_address(private_key):
+    return private_key.get_verifying_key().to_string().hex()
 
 
-def find_new_chains():
-    # Get the blockchains of every other node
-    other_chains = []
-    for node_url in peer_nodes:
-        # Get their chains using a GET request
-        block = requests.get(node_url + '/blocks').content
-        # Convert the JSON object to a Python dictionary
-        block = json.loads(block)
-        # Add it to our list
-        other_chains.append(block)
+def get_wallet_balance(blockchain, wallet_address):
+    income = sum(
+        transaction.output.amount
+        for block in blockchain
+        for transaction in block.transactions
+        if transaction.transfer.output.wallet_address == wallet_address
+    )
+    waste = sum(
+        transaction_input.amount
+        for block in blockchain
+        for transaction in block.transactions
+        for transaction_input in transaction.transfer.inputs
+        for block1 in blockchain
+        for transaction1 in block1.transactions
+        if transaction1.hash == transaction_input.transaction_hash and
+        transaction1.transfer.output.wallet_address == wallet_address
+    )
 
-    return other_chains
-
-
-def consensus():
-    # Get the blocks from other nodes
-    other_chains = find_new_chains()
-    # If our chain isn't longest, then we store the longest chain
-    global blockchain
-    longest_chain = blockchain
-    for chain in other_chains:
-        if len(longest_chain) < len(chain):
-            longest_chain = chain
-    # If the longest chain wasn't ours, then we set our chain to the longest
-    blockchain = longest_chain
+    return income - waste
 
 
-node.run(host='localhost', port=8080)
+def get_transaction_hash(transfer):
+    return hashlib.sha1(json.dumps(transfer).encode()).hexdigest()
+
+
+def check_wallet_password(wallet, password):
+    return hashlib.sha1(password.encode()).hexdigest() != wallet.password_hash
