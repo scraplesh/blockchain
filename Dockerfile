@@ -15,4 +15,4 @@ RUN apk add --update $BUILD_LIST \
 
 EXPOSE 8080
 
-ENTRYPOINT ["python", "/app/blockchain.py"]
+ENTRYPOINT ["pipenv", "run", "python", "/app/blockchain.py"]
