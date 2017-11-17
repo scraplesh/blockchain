@@ -227,4 +227,4 @@ def is_password_valid(wallet, password):
     )
 
 
-bottle.run(server='gevent')
+bottle.run(host='0.0.0.0', server='gevent')
