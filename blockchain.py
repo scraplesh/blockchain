@@ -18,7 +18,7 @@ TransactionOutput = collections.namedtuple('TransactionOutput', ['wallet_address
 TransactionTransfer = collections.namedtuple('TransactionTransfer', ['inputs', 'output'])
 Transaction = collections.namedtuple('Transaction', ['hash', 'transfer'])
 Block = collections.namedtuple('Block', ['previous_hash', 'block_hash', 'transactions'])
-AvailableAmount = collections.namedtuple('AvailableAmount', ['transactions_hash', 'amount'])
+AvailableAmount = collections.namedtuple('AvailableAmount', ['transaction_hash', 'amount'])
 
 blockchain = []
 unconfirmed_transactions = []
@@ -69,12 +69,21 @@ def create_genesis_block():
 
 
 @bottle.post('/create-transaction')
-def create_transaction(password, receiver_address, amount):
+def create_transaction():
     if wallet is None:
         bottle.abort(400, 'Wallet not found')
 
-    if is_password_valid(wallet, password):
+    password = (bottle.request.json or {}).get('password')
+    if not is_password_valid(wallet, password):
         bottle.abort(400, 'Invalid password')
+
+    receiver_address = (bottle.request.json or {}).get('receiver_address')
+    if receiver_address is None:
+        bottle.abort(400, 'Missing receiver address')
+
+    amount = (bottle.request.json or {}).get('amount')
+    if amount is None:
+        bottle.abort(400, 'Missing amount')
 
     current_blockchain = blockchain.copy()
     wallet_address = get_wallet_address(wallet.private_key)
@@ -100,7 +109,7 @@ def create_transaction(password, receiver_address, amount):
                     transaction_input
                     for block in current_blockchain
                     for transaction in block.transactions
-                    for transaction_input in transaction.transfer.inputs
+                    for transaction_input in transaction.transfer.inputs or []
                     for block1 in current_blockchain
                     for transaction1 in block1.transactions
                     if transaction1.hash == transaction_input.transaction_hash and
@@ -115,10 +124,10 @@ def create_transaction(password, receiver_address, amount):
         (
             AvailableAmount(
                 transaction.hash,
-                transaction.transfer.output.amount - transaction_spends[transaction.hash]
+                transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0)
             )
             for transaction in incoming_transactions
-            if transaction.transfer.output.amount - transaction_spends[transaction.hash] > 0
+            if transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0) > 0
         ),
         key=lambda available_amount: available_amount.amount
     )
@@ -154,8 +163,11 @@ def mine():
     is_mining = True
     while is_mining:
         if not unconfirmed_transactions:
+            yield 'No transactions to mine. Waiting...\n'
             time.sleep(CHECK_TRANSACTIONS_DELAY)
             continue
+
+        yield 'New transactions found. Mining...\n'
 
         transactions = unconfirmed_transactions.copy()
         unconfirmed_transactions.clear()
@@ -165,7 +177,7 @@ def mine():
 
         blockchain.append(new_block)
 
-    return 'Mining stopped'
+    yield 'Mining stopped'
 
 
 @bottle.post('/stop-mining')
@@ -185,7 +197,7 @@ def get_wallet_address(private_key):
 
 def get_wallet_balance(blockchain, wallet_address):
     income = sum(
-        transaction.output.amount
+        transaction.transfer.output.amount
         for block in blockchain
         for transaction in block.transactions
         if transaction.transfer.output.wallet_address == wallet_address
@@ -194,7 +206,7 @@ def get_wallet_balance(blockchain, wallet_address):
         transaction_input.amount
         for block in blockchain
         for transaction in block.transactions
-        for transaction_input in transaction.transfer.inputs
+        for transaction_input in transaction.transfer.inputs or []
         for block1 in blockchain
         for transaction1 in block1.transactions
         if transaction1.hash == transaction_input.transaction_hash and
