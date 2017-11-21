@@ -1,10 +1,10 @@
 from gevent import monkey; monkey.patch_all()  # noqa
 
-import collections
 import hashlib
 import itertools
 import json
 import time
+import typing
 
 import bottle
 import ecdsa
@@ -12,146 +12,139 @@ import ecdsa
 EMIT_PORTION = 50
 CHECK_TRANSACTIONS_DELAY = 3
 
-Wallet = collections.namedtuple('Wallet', ['password_hash', 'private_key'])
-TransactionInput = collections.namedtuple('TransactionInput', ['transaction_hash', 'amount'])
-TransactionOutput = collections.namedtuple('TransactionOutput', ['wallet_address', 'amount'])
-TransactionTransfer = collections.namedtuple('TransactionTransfer', ['inputs', 'output'])
-Transaction = collections.namedtuple('Transaction', ['hash', 'transfer'])
-Block = collections.namedtuple('Block', ['previous_hash', 'block_hash', 'transactions'])
-AvailableAmount = collections.namedtuple('AvailableAmount', ['transaction_hash', 'amount'])
-
+account = None
 blockchain = []
 unconfirmed_transactions = []
-wallet = None
+utxo = []
 is_mining = False
 
 
-@bottle.post('/create-wallet')
-def create_wallet():
-    global wallet
-    if wallet is not None:
-        bottle.abort(400, 'Wallet is already created')
+@bottle.post('/create-account')
+def create_account():
+  global account
+  if account is not None:
+    bottle.abort(400, 'account is already created')
 
-    password = (bottle.request.json or {}).get('password')
-    if password is None:
-        bottle.abort(400, 'Invalid password')
+  password = (bottle.request.json or {}).get('password')
+  if password is None:
+    bottle.abort(400, 'Invalid password')
 
-    password_hash = hashlib.sha1(password.encode()).hexdigest()
-    private_key = ecdsa.SigningKey.generate()
-    wallet = Wallet(password_hash, private_key)
+  global account
+  account = {
+      'password_hash': int(hashlib.sha1(password.encode()).hexdigest(), 16),
+      'private_key': int(ecdsa.SigningKey.generate().to_string().hex(), 16)
+  }
 
-    return 'Wallet created'
-
-
-@bottle.post('/create-genesis-block')
-def create_genesis_block():
-    if blockchain:
-        bottle.abort(400, 'Genesis block is already created')
-
-    if wallet is None:
-        bottle.abort(400, 'Wallet not found')
-
-    password = (bottle.request.json or {}).get('password')
-    if not is_password_valid(wallet, password):
-        bottle.abort(400, 'Invalid password')
-
-    receiver_address = get_wallet_address(wallet.private_key)
-    output = TransactionOutput(receiver_address, EMIT_PORTION)
-
-    transfer = TransactionTransfer(None, output)
-    transaction_hash = get_transaction_hash(transfer)
-    transaction = Transaction(transaction_hash, transfer)
-
-    genesis_block = create_block(None, [transaction])
-    blockchain.append(genesis_block)
-
-    return 'Genesis block created'
+  return 'account created'
 
 
-@bottle.post('/create-transaction')
-def create_transaction():
-    if wallet is None:
-        bottle.abort(400, 'Wallet not found')
+@bottle.post('/initial-emit')
+def initial_emit():
+  if blockchain:
+    bottle.abort(400, 'Genesis block is already created')
 
-    password = (bottle.request.json or {}).get('password')
-    if not is_password_valid(wallet, password):
-        bottle.abort(400, 'Invalid password')
+  if account is None:
+    bottle.abort(400, 'account not found')
 
-    receiver_address = (bottle.request.json or {}).get('receiver_address')
-    if receiver_address is None:
-        bottle.abort(400, 'Missing receiver address')
+  password = (bottle.request.json or {}).get('password')
+  if not is_password_valid(account, password):
+    bottle.abort(400, 'Invalid password')
 
-    amount = (bottle.request.json or {}).get('amount')
-    if amount is None:
-        bottle.abort(400, 'Missing amount')
+  inputs = []
+  outputs = [{'receiver': get_account_address(account), 'amount': EMIT_PORTION}]
+  unconfirmed_transactions.append({
+      'txid': get_txid(inputs, outputs),
+      'inputs': inputs,
+      'outputs': outputs
+  })
 
-    current_blockchain = blockchain.copy()
-    wallet_address = get_wallet_address(wallet.private_key)
-    wallet_balance = get_wallet_balance(current_blockchain, wallet_address)
-    if amount > wallet_balance:
-        bottle.abort(400, 'Not enough tokens')
+  utxo.extend(outputs)
 
-    output = TransactionOutput(receiver_address, amount)
 
-    incoming_transactions = (
-        transaction
-        for block in current_blockchain
-        for transaction in block.transactions
-        if transaction.transfer.output.wallet_address == wallet_address
-    )
-    transaction_spends = {
-        transaction_input.transaction_hash: sum(
-            transaction_input.amount for transaction_input in transaction_inputs
-        )
-        for transaction_input, transaction_inputs in itertools.groupby(
-            sorted(
-                (
-                    transaction_input
-                    for block in current_blockchain
-                    for transaction in block.transactions
-                    for transaction_input in transaction.transfer.inputs or []
-                    for block1 in current_blockchain
-                    for transaction1 in block1.transactions
-                    if transaction1.hash == transaction_input.transaction_hash and
-                    transaction1.transfer.output.wallet_address == wallet_address
-                ),
-                key=lambda t: t.transaction_hash
-            ),
-            key=lambda t: t.transaction_hash
-        )
-    }
-    available_amounts = sorted(
-        (
-            AvailableAmount(
-                transaction.hash,
-                transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0)
-            )
-            for transaction in incoming_transactions
-            if transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0) > 0
-        ),
-        key=lambda available_amount: available_amount.amount
-    )
+@bottle.post('/transfer')
+def transfer():
+  if account is None:
+      bottle.abort(400, 'account not found')
 
-    inputs = []
-    checking_amount = amount
-    for available_amount in available_amounts:
-        if available_amount.amount >= checking_amount:
-            inputs.append(TransactionInput(available_amount.transaction_hash, checking_amount))
-            break
+  password = (bottle.request.json or {}).get('password')
+  if not is_password_valid(account, password):
+      bottle.abort(400, 'Invalid password')
 
-        inputs.append(
-            TransactionInput(
-                available_amount.transaction_hash,
-                checking_amount - available_amount.amount
-            )
-        )
-        checking_amount -= available_amount.amount
+  receiver = (bottle.request.json or {}).get('receiver')
+  if receiver is None:
+      bottle.abort(400, 'Missing receiver address')
 
-    transfer = TransactionTransfer(inputs, output)
-    transaction_hash = get_transaction_hash(transfer)
-    transaction = Transaction(transaction_hash, transfer)
+  amount = (bottle.request.json or {}).get('amount')
+  if amount is None:
+      bottle.abort(400, 'Missing amount')
 
-    unconfirmed_transactions.append(transaction)
+  current_blockchain = blockchain.copy()
+  account_address = get_account_address(account.private_key)
+  account_balance = get_account_balance(current_blockchain, account_address)
+  if amount > account_balance:
+      bottle.abort(400, 'Not enough tokens')
+
+  outputs = TransactionOutput(receiver, amount)
+
+  incoming_transactions = (
+      transaction
+      for block in current_blockchain
+      for transaction in block.transactions
+      if transaction.transfer.output.account_address == account_address
+  )
+  transaction_spends = {
+      transaction_input.transaction_hash: sum(
+          transaction_input.amount for transaction_input in transaction_inputs
+      )
+      for transaction_input, transaction_inputs in itertools.groupby(
+          sorted(
+              (
+                  transaction_input
+                  for block in current_blockchain
+                  for transaction in block.transactions
+                  for transaction_input in transaction.transfer.inputs or []
+                  for block1 in current_blockchain
+                  for transaction1 in block1.transactions
+                  if transaction1.hash == transaction_input.transaction_hash and
+                  transaction1.transfer.output.account_address == account_address
+              ),
+              key=lambda t: t.transaction_hash
+          ),
+          key=lambda t: t.transaction_hash
+      )
+  }
+  available_amounts = sorted(
+      (
+          AvailableAmount(
+              transaction.hash,
+              transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0)
+          )
+          for transaction in incoming_transactions
+          if transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0) > 0
+      ),
+      key=lambda available_amount: available_amount.amount
+  )
+
+  inputs = []
+  checking_amount = amount
+  for available_amount in available_amounts:
+      if available_amount.amount >= checking_amount:
+          inputs.append(TransactionInput(available_amount.transaction_hash, checking_amount))
+          break
+
+      inputs.append(
+          TransactionInput(
+              available_amount.transaction_hash,
+              checking_amount - available_amount.amount
+          )
+      )
+      checking_amount -= available_amount.amount
+
+  transfer = TransactionTransfer(inputs, output)
+  transaction_hash = get_txid(transfer)
+  transaction = Transaction(transaction_hash, transfer)
+
+  unconfirmed_transactions.append(transaction)
 
 
 @bottle.post('/mine')
@@ -191,16 +184,16 @@ def create_block(previous_block_hash, transactions):
     return Block(previous_block_hash, block_hash, transactions)
 
 
-def get_wallet_address(private_key):
-    return private_key.get_verifying_key().to_string().hex()
+def get_account_address(account):
+    return account['private_key'].get_verifying_key().to_string().hex()
 
 
-def get_wallet_balance(blockchain, wallet_address):
+def get_account_balance(blockchain, account_address):
     income = sum(
         transaction.transfer.output.amount
         for block in blockchain
         for transaction in block.transactions
-        if transaction.transfer.output.wallet_address == wallet_address
+        if transaction.transfer.output.account_address == account_address
     )
     waste = sum(
         transaction_input.amount
@@ -210,20 +203,20 @@ def get_wallet_balance(blockchain, wallet_address):
         for block1 in blockchain
         for transaction1 in block1.transactions
         if transaction1.hash == transaction_input.transaction_hash and
-        transaction1.transfer.output.wallet_address == wallet_address
+        transaction1.transfer.output.account_address == account_address
     )
 
     return income - waste
 
 
-def get_transaction_hash(transfer):
-    return hashlib.sha1(json.dumps(transfer).encode()).hexdigest()
+def get_txid(inputs, outputs):
+    return int(hashlib.sha1(json.dumps(inputs + outputs).encode()).hexdigest(), 16)
 
 
-def is_password_valid(wallet, password):
+def is_password_valid(account, password):
     return (
         password is not None and
-        hashlib.sha1(password.encode()).hexdigest() == wallet.password_hash
+        hashlib.sha1(password.encode()).hexdigest() == account['password_hash']
     )
 
 
