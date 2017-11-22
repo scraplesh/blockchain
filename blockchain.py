@@ -1,51 +1,52 @@
-from gevent import monkey; monkey.patch_all()  # noqa
-
+import asyncio
 import hashlib
 import json
-import time
 
-import bottle
 import ecdsa
+from aiohttp import web
 
 account = None
 blockchain = []
 unconfirmed_transactions = []
 is_mining = False
 
+routes = web.RouteTableDef()
 
-@bottle.post('/create-account')
-def create_account():
+
+@routes.post('/create-account')
+async def create_account(request):
   global account
   if account is not None:
-    bottle.abort(400, 'Account is already created')
+    raise web.HTTPBadRequest('Account is already created')
 
-  password = (bottle.request.json or {}).get('password')
-  if password is None:
-    bottle.abort(400, 'Invalid password')
+  body = await request.json()
+  if 'password' not in body:
+    raise web.HTTPBadRequest('Invalid password')
 
+  password = body['password']
   account = {
       'password_hash': hashlib.sha1(password.encode()).hexdigest(),
       'private_key': ecdsa.SigningKey.generate()
   }
 
-  return 'Account created'
+  return web.Response(text='Account created')
 
 
-@bottle.post('/emit')
-def emit():
+@routes.post('/emit')
+async def emit(request):
   if blockchain:
-    bottle.abort(400, 'Genesis block is already created')
+    raise web.HTTPBadRequest('Genesis block is already created')
 
   if account is None:
-    bottle.abort(400, 'Account not found')
+    raise web.HTTPBadRequest('Account not found')
 
-  password = (bottle.request.json or {}).get('password')
-  if not is_password_valid(account, password):
-    bottle.abort(400, 'Invalid password')
+  body = await request.json()
+  if 'password' not in body or not is_password_valid(account, body['password']):
+    raise web.HTTPBadRequest('Invalid password')
 
-  amount = (bottle.request.json or {}).get('amount')
-  if amount is None:
-    bottle.abort(400, 'Invalid amount')
+  if 'amount' not in body:
+    raise web.HTTPBadRequest('Invalid amount')
+  amount = body['amount']
 
   inputs = []
   receiver = get_address(account)
@@ -56,25 +57,26 @@ def emit():
       'output': output
   })
 
-  return f'Emitted {amount} tokens'
+  return web.Response(text=f'Emitted {amount} tokens')
 
 
-@bottle.post('/transfer')
-def transfer():
+@routes.post('/transfer')
+async def transfer(request):
   if account is None:
-    bottle.abort(400, 'Account not found')
+    raise web.HTTPBadRequest('Account not found')
 
-  password = (bottle.request.json or {}).get('password')
-  if not is_password_valid(account, password):
-    bottle.abort(400, 'Invalid password')
+  body = await request.json()
 
-  receiver = (bottle.request.json or {}).get('receiver')
-  if receiver is None:
-    bottle.abort(400, 'Missing receiver address')
+  if 'password' not in body or not is_password_valid(account, body['password']):
+    raise web.HTTPBadRequest('Invalid password')
 
-  amount = (bottle.request.json or {}).get('amount')
-  if amount is None:
-    bottle.abort(400, 'Missing amount')
+  if 'receiver' not in body:
+    raise web.HTTPBadRequest('Missing receiver address')
+  receiver = body['receiver']
+
+  if 'amount' not in body:
+    raise web.HTTPBadRequest('Missing amount')
+  amount = body['amount']
 
   output = get_output(receiver, amount)
 
@@ -91,7 +93,7 @@ def transfer():
   )
   balance = sum(transaction['output']['amount'] for transaction in account_utxo)
   if balance < amount:
-    bottle.abort(400, 'Not enough tokens')
+    raise web.HTTPBadRequest('Not enough tokens')
 
   inputs = []
   remaining_amount = amount
@@ -106,24 +108,29 @@ def transfer():
       'output': output
   })
 
-  return f'Transfered {amount} tokens from {address} to {receiver}'
+  return web.Response(text=f'Transfered {amount} tokens from {address} to {receiver}')
 
 
-@bottle.post('/mine')
-def mine():
-  check_delay = int((bottle.request.json or {}).get('check_delay'))
-  if check_delay is None:
-    bottle.abort(400, 'Check delay not found')
+@routes.post('/mine')
+async def mine(request):
+  body = await request.json()
+  check_delay = int(body['check_delay'])
 
   global is_mining
   is_mining = True
+
+  resp = web.StreamResponse(reason='OK', headers={'Content-Type': 'text/html'})
+  await resp.prepare(request)
+
   while is_mining:
       if not unconfirmed_transactions:
-          yield 'No transactions to mine. Waiting...\n'
-          time.sleep(check_delay)
+          resp.write(b'No transactions to mine. Waiting...\n')
+          await resp.drain()
+          await asyncio.sleep(check_delay)
           continue
 
-      yield 'New transactions found. Mining...\n'
+      resp.write(b'New transactions found. Mining...\n')
+      await resp.drain()
 
       transactions = unconfirmed_transactions.copy()
       unconfirmed_transactions.clear()
@@ -133,19 +140,19 @@ def mine():
 
       blockchain.append(new_block)
 
-  yield 'Mining stopped'
+  return resp
 
 
-@bottle.post('/stop-mining')
-def stop_mining():
+@routes.post('/stop-mining')
+async def stop_mining(request):
     global is_mining
     is_mining = False
+    return web.Response(text="Mining stopped")
 
 
-@bottle.get('/blocks')
-def get_blocks():
-  bottle.response.content_type = 'application/json'
-  return json.dumps(blockchain, indent=4)
+@routes.get('/blocks')
+async def get_blocks(request):
+  return web.json_response(blockchain)
 
 
 def get_utxo(blockchain):
@@ -190,4 +197,7 @@ def is_password_valid(account, password):
     )
 
 
-bottle.run(host='0.0.0.0', server='gevent')
+app = web.Application()
+app.router.add_routes(routes)
+
+web.run_app(app, host='0.0.0.0', port=8080)
