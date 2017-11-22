@@ -83,19 +83,22 @@ def transfer():
       [
           transaction
           for transaction in get_utxo(blockchain.copy())
-          if transaction['receiver'] == address and transaction['output']['amount'] > amount
+          if transaction['output']['receiver'] == address and
+          transaction['output']['amount'] > amount
       ],
-      key=lambda transaction: transaction['amount'],
-      reversed=True
+      key=lambda transaction: transaction['output']['amount'],
+      reverse=True
   )
+  balance = sum(transaction['output']['amount'] for transaction in account_utxo)
+  if balance < amount:
+    bottle.abort(400, 'Not enough tokens')
+
   inputs = []
-  inputs_sum = 0
+  remaining_amount = amount
   for transaction in account_utxo:
-    if inputs_sum < amount:
-      transaction_amount = transaction['output']['amount']
-      if transaction_amount < amount - inputs_sum:
-        inputs_sum += transaction_amount
-        inputs.append({'transaction_id': transaction['transaction_id']})
+    if remaining_amount > 0:
+      inputs.append({'transaction_id': transaction['transaction_id']})
+      remaining_amount -= transaction['output']['amount']
 
   unconfirmed_transactions.append({
       'transaction_id': get_transaction_id(inputs, output),
@@ -139,9 +142,15 @@ def stop_mining():
     is_mining = False
 
 
+@bottle.get('/blocks')
+def get_blocks():
+  bottle.response.content_type = 'application/json'
+  return json.dumps(blockchain, indent=4)
+
+
 def get_utxo(blockchain):
   inputs = [
-      txin['output']['transaction_id']
+      txin['transaction_id']
       for block in blockchain
       for transaction in block['transactions']
       for txin in transaction['inputs']
