@@ -51,7 +51,8 @@ def initial_emit():
     bottle.abort(400, 'Invalid password')
 
   inputs = []
-  outputs = [{'receiver': get_account_address(account), 'amount': EMIT_PORTION}]
+  receiver = get_address(account)
+  outputs = [get_output(receiver, EMIT_PORTION)]
   unconfirmed_transactions.append({
       'txid': get_txid(inputs, outputs),
       'inputs': inputs,
@@ -64,85 +65,30 @@ def initial_emit():
 @bottle.post('/transfer')
 def transfer():
   if account is None:
-      bottle.abort(400, 'account not found')
+    bottle.abort(400, 'account not found')
 
   password = (bottle.request.json or {}).get('password')
   if not is_password_valid(account, password):
-      bottle.abort(400, 'Invalid password')
+    bottle.abort(400, 'Invalid password')
 
   receiver = (bottle.request.json or {}).get('receiver')
   if receiver is None:
-      bottle.abort(400, 'Missing receiver address')
+    bottle.abort(400, 'Missing receiver address')
 
   amount = (bottle.request.json or {}).get('amount')
   if amount is None:
-      bottle.abort(400, 'Missing amount')
+    bottle.abort(400, 'Missing amount')
 
   current_blockchain = blockchain.copy()
-  account_address = get_account_address(account.private_key)
-  account_balance = get_account_balance(current_blockchain, account_address)
-  if amount > account_balance:
+  address = get_address(account)
+  balance = get_balance(current_blockchain, address)
+  if amount > balance:
       bottle.abort(400, 'Not enough tokens')
 
-  outputs = TransactionOutput(receiver, amount)
+  outputs = [get_output(receiver, amount)]
 
-  incoming_transactions = (
-      transaction
-      for block in current_blockchain
-      for transaction in block.transactions
-      if transaction.transfer.output.account_address == account_address
-  )
-  transaction_spends = {
-      transaction_input.transaction_hash: sum(
-          transaction_input.amount for transaction_input in transaction_inputs
-      )
-      for transaction_input, transaction_inputs in itertools.groupby(
-          sorted(
-              (
-                  transaction_input
-                  for block in current_blockchain
-                  for transaction in block.transactions
-                  for transaction_input in transaction.transfer.inputs or []
-                  for block1 in current_blockchain
-                  for transaction1 in block1.transactions
-                  if transaction1.hash == transaction_input.transaction_hash and
-                  transaction1.transfer.output.account_address == account_address
-              ),
-              key=lambda t: t.transaction_hash
-          ),
-          key=lambda t: t.transaction_hash
-      )
-  }
-  available_amounts = sorted(
-      (
-          AvailableAmount(
-              transaction.hash,
-              transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0)
-          )
-          for transaction in incoming_transactions
-          if transaction.transfer.output.amount - transaction_spends.get(transaction.hash, 0) > 0
-      ),
-      key=lambda available_amount: available_amount.amount
-  )
+  utxo = get_utxo(current_blockchain)
 
-  inputs = []
-  checking_amount = amount
-  for available_amount in available_amounts:
-      if available_amount.amount >= checking_amount:
-          inputs.append(TransactionInput(available_amount.transaction_hash, checking_amount))
-          break
-
-      inputs.append(
-          TransactionInput(
-              available_amount.transaction_hash,
-              checking_amount - available_amount.amount
-          )
-      )
-      checking_amount -= available_amount.amount
-
-  transfer = TransactionTransfer(inputs, output)
-  transaction_hash = get_txid(transfer)
-  transaction = Transaction(transaction_hash, transfer)
 
   unconfirmed_transactions.append(transaction)
 
@@ -179,21 +125,40 @@ def stop_mining():
     is_mining = False
 
 
+def get_utxo(blockchain):
+  txins = [
+      txin['output']['txid']
+      for block in blockchain
+      for tx in block['transactions']
+      for txin in tx['inputs']
+  ]
+  return [
+      tx
+      for block in blockchain
+      for tx in block['transactions']
+      if tx['txid'] not in txins
+  ]
+
+
+def get_output(address, amount):
+  return {'receiver': address, 'amount': amount}
+
+
 def create_block(previous_block_hash, transactions):
     block_hash = hashlib.sha1(json.dumps(transactions).encode()).hexdigest()
     return Block(previous_block_hash, block_hash, transactions)
 
 
-def get_account_address(account):
+def get_address(account):
     return account['private_key'].get_verifying_key().to_string().hex()
 
 
-def get_account_balance(blockchain, account_address):
+def get_balance(blockchain, address):
     income = sum(
         transaction.transfer.output.amount
         for block in blockchain
         for transaction in block.transactions
-        if transaction.transfer.output.account_address == account_address
+        if transaction.transfer.output.address == address
     )
     waste = sum(
         transaction_input.amount
@@ -203,7 +168,7 @@ def get_account_balance(blockchain, account_address):
         for block1 in blockchain
         for transaction1 in block1.transactions
         if transaction1.hash == transaction_input.transaction_hash and
-        transaction1.transfer.output.account_address == account_address
+        transaction1.transfer.output.address == address
     )
 
     return income - waste
