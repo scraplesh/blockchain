@@ -1,21 +1,15 @@
 from gevent import monkey; monkey.patch_all()  # noqa
 
 import hashlib
-import itertools
 import json
 import time
-import typing
 
 import bottle
 import ecdsa
 
-EMIT_PORTION = 50
-CHECK_TRANSACTIONS_DELAY = 3
-
 account = None
 blockchain = []
 unconfirmed_transactions = []
-utxo = []
 is_mining = False
 
 
@@ -23,49 +17,52 @@ is_mining = False
 def create_account():
   global account
   if account is not None:
-    bottle.abort(400, 'account is already created')
+    bottle.abort(400, 'Account is already created')
 
   password = (bottle.request.json or {}).get('password')
   if password is None:
     bottle.abort(400, 'Invalid password')
 
-  global account
   account = {
-      'password_hash': int(hashlib.sha1(password.encode()).hexdigest(), 16),
-      'private_key': int(ecdsa.SigningKey.generate().to_string().hex(), 16)
+      'password_hash': hashlib.sha1(password.encode()).hexdigest(),
+      'private_key': ecdsa.SigningKey.generate()
   }
 
-  return 'account created'
+  return 'Account created'
 
 
-@bottle.post('/initial-emit')
-def initial_emit():
+@bottle.post('/emit')
+def emit():
   if blockchain:
     bottle.abort(400, 'Genesis block is already created')
 
   if account is None:
-    bottle.abort(400, 'account not found')
+    bottle.abort(400, 'Account not found')
 
   password = (bottle.request.json or {}).get('password')
   if not is_password_valid(account, password):
     bottle.abort(400, 'Invalid password')
 
+  amount = (bottle.request.json or {}).get('amount')
+  if amount is None:
+    bottle.abort(400, 'Invalid amount')
+
   inputs = []
   receiver = get_address(account)
-  outputs = [get_output(receiver, EMIT_PORTION)]
+  output = get_output(receiver, amount)
   unconfirmed_transactions.append({
-      'txid': get_txid(inputs, outputs),
+      'transaction_id': get_transaction_id(inputs, output),
       'inputs': inputs,
-      'outputs': outputs
+      'output': output
   })
 
-  utxo.extend(outputs)
+  return f'Emitted {amount} tokens'
 
 
 @bottle.post('/transfer')
 def transfer():
   if account is None:
-    bottle.abort(400, 'account not found')
+    bottle.abort(400, 'Account not found')
 
   password = (bottle.request.json or {}).get('password')
   if not is_password_valid(account, password):
@@ -79,44 +76,61 @@ def transfer():
   if amount is None:
     bottle.abort(400, 'Missing amount')
 
-  current_blockchain = blockchain.copy()
+  output = get_output(receiver, amount)
+
   address = get_address(account)
-  balance = get_balance(current_blockchain, address)
-  if amount > balance:
-      bottle.abort(400, 'Not enough tokens')
+  account_utxo = sorted(
+      [
+          transaction
+          for transaction in get_utxo(blockchain.copy())
+          if transaction['receiver'] == address and transaction['output']['amount'] > amount
+      ],
+      key=lambda transaction: transaction['amount'],
+      reversed=True
+  )
+  inputs = []
+  inputs_sum = 0
+  for transaction in account_utxo:
+    if inputs_sum < amount:
+      transaction_amount = transaction['output']['amount']
+      if transaction_amount < amount - inputs_sum:
+        inputs_sum += transaction_amount
+        inputs.append({'transaction_id': transaction['transaction_id']})
 
-  outputs = [get_output(receiver, amount)]
+  unconfirmed_transactions.append({
+      'transaction_id': get_transaction_id(inputs, output),
+      'inputs': inputs,
+      'output': output
+  })
 
-  utxo = get_utxo(current_blockchain)
-
-
-  unconfirmed_transactions.append(transaction)
+  return f'Transfered {amount} tokens from {address} to {receiver}'
 
 
 @bottle.post('/mine')
 def mine():
-    if not blockchain:
-        bottle.abort(400, 'Cannot mine on empty blockchain')
+  check_delay = int((bottle.request.json or {}).get('check_delay'))
+  if check_delay is None:
+    bottle.abort(400, 'Check delay not found')
 
-    global is_mining
-    is_mining = True
-    while is_mining:
-        if not unconfirmed_transactions:
-            yield 'No transactions to mine. Waiting...\n'
-            time.sleep(CHECK_TRANSACTIONS_DELAY)
-            continue
+  global is_mining
+  is_mining = True
+  while is_mining:
+      if not unconfirmed_transactions:
+          yield 'No transactions to mine. Waiting...\n'
+          time.sleep(check_delay)
+          continue
 
-        yield 'New transactions found. Mining...\n'
+      yield 'New transactions found. Mining...\n'
 
-        transactions = unconfirmed_transactions.copy()
-        unconfirmed_transactions.clear()
+      transactions = unconfirmed_transactions.copy()
+      unconfirmed_transactions.clear()
 
-        previous_block = blockchain[-1]
-        new_block = create_block(previous_block.block_hash, transactions)
+      previous_block = blockchain[-1] if blockchain else None
+      new_block = create_block(previous_block, transactions)
 
-        blockchain.append(new_block)
+      blockchain.append(new_block)
 
-    yield 'Mining stopped'
+  yield 'Mining stopped'
 
 
 @bottle.post('/stop-mining')
@@ -126,17 +140,17 @@ def stop_mining():
 
 
 def get_utxo(blockchain):
-  txins = [
-      txin['output']['txid']
+  inputs = [
+      txin['output']['transaction_id']
       for block in blockchain
-      for tx in block['transactions']
-      for txin in tx['inputs']
+      for transaction in block['transactions']
+      for txin in transaction['inputs']
   ]
   return [
-      tx
+      transaction
       for block in blockchain
-      for tx in block['transactions']
-      if tx['txid'] not in txins
+      for transaction in block['transactions']
+      if transaction['transaction_id'] not in inputs
   ]
 
 
@@ -144,38 +158,20 @@ def get_output(address, amount):
   return {'receiver': address, 'amount': amount}
 
 
-def create_block(previous_block_hash, transactions):
-    block_hash = hashlib.sha1(json.dumps(transactions).encode()).hexdigest()
-    return Block(previous_block_hash, block_hash, transactions)
+def create_block(previous_block, transactions):
+    return {
+        'previous_block_id': None if previous_block is None else previous_block['block_id'],
+        'block_id': hashlib.sha1(json.dumps(transactions).encode()).hexdigest(),
+        'transactions': transactions
+    }
 
 
 def get_address(account):
     return account['private_key'].get_verifying_key().to_string().hex()
 
 
-def get_balance(blockchain, address):
-    income = sum(
-        transaction.transfer.output.amount
-        for block in blockchain
-        for transaction in block.transactions
-        if transaction.transfer.output.address == address
-    )
-    waste = sum(
-        transaction_input.amount
-        for block in blockchain
-        for transaction in block.transactions
-        for transaction_input in transaction.transfer.inputs or []
-        for block1 in blockchain
-        for transaction1 in block1.transactions
-        if transaction1.hash == transaction_input.transaction_hash and
-        transaction1.transfer.output.address == address
-    )
-
-    return income - waste
-
-
-def get_txid(inputs, outputs):
-    return int(hashlib.sha1(json.dumps(inputs + outputs).encode()).hexdigest(), 16)
+def get_transaction_id(inputs, output):
+    return hashlib.sha1(json.dumps(inputs + [output]).encode()).hexdigest()
 
 
 def is_password_valid(account, password):
